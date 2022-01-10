@@ -2,7 +2,7 @@
 #define SQL_TYPE_H_INCLUDED
 /*
    Copyright (c) 2015  MariaDB Foundation.
-   Copyright (c) 2015, 2020, MariaDB Corporation.
+   Copyright (c) 2015, 2021, MariaDB Corporation.
 
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -45,6 +45,7 @@ class Item_param;
 class Item_cache;
 class Item_copy;
 class Item_func_or_sum;
+class Item_sum;
 class Item_sum_hybrid;
 class Item_sum_sum;
 class Item_sum_avg;
@@ -3764,6 +3765,14 @@ public:
     incompatible data type.
   */
   virtual bool is_param_long_data_type() const { return false; }
+  /*
+    The base type handler "this" is derived from.
+    "This" inherits aggregation rules from the base type handler.
+  */
+  virtual const Type_handler *type_handler_base() const
+  {
+    return NULL;
+  }
   virtual const Type_handler *type_handler_for_comparison() const= 0;
   virtual const Type_handler *type_handler_for_native_format() const
   {
@@ -7403,6 +7412,33 @@ public:
   virtual const Type_handler *aggregate_for_num_op(const Type_handler *h1,
                                                    const Type_handler *h2)
                                                    const= 0;
+};
+
+
+class Type_handler_pair
+{
+  const Type_handler *m_a;
+  const Type_handler *m_b;
+public:
+  Type_handler_pair(const Type_handler *a,
+                    const Type_handler *b)
+   :m_a(a), m_b(b)
+  { }
+  const Type_handler *a() const { return m_a; }
+  const Type_handler *b() const { return m_b; }
+  Type_handler_pair to_base_or_self() const
+  {
+    Type_handler_pair tmp(m_a->type_handler_base(), m_b->type_handler_base());
+    if (!tmp.m_a)
+      tmp.m_a= m_a;
+    if (!tmp.m_b)
+      tmp.m_b= m_b;
+    return tmp;
+  }
+  uint diff(const Type_handler_pair &rhs) const
+  {
+    return (m_a != rhs.m_a) + (m_b != rhs.m_b);
+  }
 };
 
 
