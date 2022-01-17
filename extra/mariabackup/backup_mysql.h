@@ -62,10 +62,10 @@ void
 unlock_all(MYSQL *connection);
 
 bool
-write_current_binlog_file(MYSQL *connection);
+write_current_binlog_file(MYSQL *connection, bool write_binlogs);
 
 bool
-write_binlog_info(MYSQL *connection);
+write_binlog_info(MYSQL *connection, char *log_bin_dir);
 
 bool
 write_xtrabackup_info(MYSQL *connection, const char * filename, bool history,

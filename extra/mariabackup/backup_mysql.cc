@@ -1337,25 +1337,12 @@ cleanup:
 Flush and copy the current binary log file into the backup,
 if GTID is enabled */
 bool
-write_current_binlog_file(MYSQL *connection)
+write_current_binlog_file(MYSQL *connection, bool write_binlogs)
 {
-	char *executed_gtid_set = NULL;
 	char *gtid_binlog_state = NULL;
-	char *log_bin_file = NULL;
 	char *log_bin_dir = NULL;
-	bool gtid_exists;
+	bool gtid_exists = false;
 	bool result = true;
-	char filepath[FN_REFLEN];
-
-	mysql_variable status[] = {
-		{"Executed_Gtid_Set", &executed_gtid_set},
-		{NULL, NULL}
-	};
-
-	mysql_variable status_after_flush[] = {
-		{"File", &log_bin_file},
-		{NULL, NULL}
-	};
 
 	mysql_variable vars[] = {
 		{"gtid_binlog_state", &gtid_binlog_state},
@@ -1363,13 +1350,36 @@ write_current_binlog_file(MYSQL *connection)
 		{NULL, NULL}
 	};
 
-	read_mysql_variables(connection, "SHOW MASTER STATUS", status, false);
 	read_mysql_variables(connection, "SHOW VARIABLES", vars, true);
 
-	gtid_exists = (executed_gtid_set && *executed_gtid_set)
-			|| (gtid_binlog_state && *gtid_binlog_state);
+	if (!write_binlogs) {
 
-	if (gtid_exists) {
+		char *executed_gtid_set = NULL;
+
+		mysql_variable status[] = {
+			{"Executed_Gtid_Set", &executed_gtid_set},
+			{NULL, NULL}
+		};
+
+		read_mysql_variables(connection, "SHOW MASTER STATUS", status, false);
+
+		gtid_exists = (executed_gtid_set && *executed_gtid_set)
+				|| (gtid_binlog_state && *gtid_binlog_state);
+
+		free_mysql_variables(status);
+
+	}
+
+	if (write_binlogs || gtid_exists) {
+
+		char *log_bin_file = NULL;
+		char filepath[FN_REFLEN];
+
+		mysql_variable status_after_flush[] = {
+			{"File", &log_bin_file},
+			{NULL, NULL}
+		};
+
 		size_t log_bin_dir_length;
 
 		lock_binlog_maybe(connection);
@@ -1405,14 +1415,31 @@ write_current_binlog_file(MYSQL *connection)
 			goto cleanup;
 		}
 
-		snprintf(filepath, sizeof(filepath), "%s%c%s",
-			 log_bin_dir, FN_LIBCHAR, log_bin_file);
-		result = copy_file(ds_data, filepath, log_bin_file, 0);
+		MYSQL_RES *mysql_result;
+		MYSQL_ROW row;
+
+		mysql_result = xb_mysql_query(connection, "SHOW BINARY LOGS", true);
+
+		ut_ad(mysql_num_fields(mysql_result) >= 2);
+
+		while ((row = mysql_fetch_row(mysql_result))) {
+			const char *binlog_name = row[0];
+			snprintf(filepath, sizeof(filepath), "%s%c%s",
+				 log_bin_dir, FN_LIBCHAR, binlog_name);
+			if (file_exists(filepath)) {
+				result = copy_file(ds_data, filepath, binlog_name, 0);
+				if (!result) break;
+			}
+		}
+
+		mysql_free_result(mysql_result);
+
+		write_binlog_info(connection, log_bin_dir);
+cleanup:
+		free_mysql_variables(status_after_flush);
+
 	}
 
-cleanup:
-	free_mysql_variables(status_after_flush);
-	free_mysql_variables(status);
 	free_mysql_variables(vars);
 
 	return(result);
@@ -1423,7 +1450,7 @@ cleanup:
 Retrieves MySQL binlog position and
 saves it in a file. It also prints it to stdout. */
 bool
-write_binlog_info(MYSQL *connection)
+write_binlog_info(MYSQL *connection, char *log_bin_dir)
 {
 	char *filename = NULL;
 	char *position = NULL;
@@ -1431,9 +1458,16 @@ write_binlog_info(MYSQL *connection)
 	char *gtid_current_pos = NULL;
 	char *gtid_executed = NULL;
 	char *gtid = NULL;
+	char *buffer;
+	char *buf;
+	int total;
+	int position_length;
+	int bytes;
 	bool result;
 	bool mysql_gtid;
 	bool mariadb_gtid;
+	bool with_gtid;
+	MYSQL_ROW_OFFSET start;
 
 	mysql_variable status[] = {
 		{"File", &filename},
@@ -1461,23 +1495,95 @@ write_binlog_info(MYSQL *connection)
 	mysql_gtid = ((gtid_mode != NULL) && (strcmp(gtid_mode, "ON") == 0));
 	mariadb_gtid = (gtid_current_pos != NULL);
 
+	with_gtid = mariadb_gtid || mysql_gtid;
+
 	gtid = (gtid_executed != NULL ? gtid_executed : gtid_current_pos);
 
-	if (mariadb_gtid || mysql_gtid) {
+	if (with_gtid) {
 		ut_a(asprintf(&mysql_binlog_position,
 			"filename '%s', position '%s', "
 			"GTID of the last change '%s'",
 			filename, position, gtid) != -1);
-		result = backup_file_printf(XTRABACKUP_BINLOG_INFO,
-					    "%s\t%s\t%s\n", filename, position,
-					    gtid);
 	} else {
 		ut_a(asprintf(&mysql_binlog_position,
 			"filename '%s', position '%s'",
 			filename, position) != -1);
-		result = backup_file_printf(XTRABACKUP_BINLOG_INFO,
-					    "%s\t%s\n", filename, position);
 	}
+
+	MYSQL_RES *mysql_result;
+	MYSQL_ROW row;
+
+	mysql_result = xb_mysql_query(connection, "SHOW BINARY LOGS", true);
+
+	ut_ad(mysql_num_fields(mysql_result) >= 2);
+	start = mysql_row_tell(mysql_result);
+
+	position_length = strlen(position) + 2;
+	if (with_gtid) {
+		position_length += strlen(gtid) + 1;
+	}
+
+	total = strlen(filename) + position_length + 1;
+	while ((row = mysql_fetch_row(mysql_result))) {
+		const char *binlog_name = row[0];
+		if (strcmp(binlog_name, filename) == 0) {
+			continue;
+		}
+		total += strlen(binlog_name) + position_length;
+	}
+
+	buffer = static_cast<char*>(malloc(total));
+	if (!buffer) {
+		msg("Failed to allocate memory for temporary buffer");
+		result = false;
+		goto cleanup2;
+	}
+
+	mysql_row_seek(mysql_result, start);
+
+	buf = buffer;
+	while ((row = mysql_fetch_row(mysql_result))) {
+		const char *binlog_name = row[0];
+		if (strcmp(binlog_name, filename) == 0) {
+			continue;
+		}
+		char filepath[FN_REFLEN];
+		snprintf(filepath, sizeof(filepath), "%s%c%s",
+			 log_bin_dir, FN_LIBCHAR, binlog_name);
+		if (file_exists(filepath)) {
+			if (with_gtid) {
+				bytes = snprintf(buf, total, "%s\t%s\t%s\n", binlog_name, position, gtid);
+			} else {
+				bytes = snprintf(buf, total, "%s\t%s\n", binlog_name, position);
+			}
+			if (bytes <= 0) {
+				msg("Buffer overflow in write_binlog_info");
+				result = false;
+				goto cleanup3;
+			}
+			buf += bytes;
+			total -= bytes;
+		}
+	}
+
+	if (with_gtid) {
+		bytes = snprintf(buf, total, "%s\t%s\t%s\n", filename, position, gtid);
+	} else {
+		bytes = snprintf(buf, total, "%s\t%s\n", filename, position);
+	}
+	if (bytes <= 0) {
+		msg("Buffer overflow in write_binlog_info");
+		result = false;
+		goto cleanup3;
+	}
+
+	result = backup_file_printf(XTRABACKUP_BINLOG_INFO, "%s", buffer);
+
+cleanup3:
+	free(buffer);
+
+cleanup2:
+	mysql_free_result(mysql_result);
 
 cleanup:
 	free_mysql_variables(status);
