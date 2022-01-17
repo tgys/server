@@ -1339,6 +1339,9 @@ if GTID is enabled */
 bool
 write_current_binlog_file(MYSQL *connection, bool write_binlogs)
 {
+	char *filename = NULL;
+	char *position = NULL;
+	char *executed_gtid_set = NULL;
 	char *gtid_binlog_state = NULL;
 	char *log_bin_dir = NULL;
 	bool gtid_exists = false;
@@ -1350,23 +1353,27 @@ write_current_binlog_file(MYSQL *connection, bool write_binlogs)
 		{NULL, NULL}
 	};
 
+	mysql_variable status[] = {
+		{"File", &filename},
+		{"Position", &position},
+		{"Executed_Gtid_Set", &executed_gtid_set},
+		{NULL, NULL}
+	};
+
+	read_mysql_variables(connection, "SHOW MASTER STATUS", status, false);
+
+	if (filename == NULL || position == NULL) {
+		/* Do not create xtrabackup_binlog_info if binary
+		log is disabled */
+		goto cleanup2;
+	}
+
 	read_mysql_variables(connection, "SHOW VARIABLES", vars, true);
 
 	if (!write_binlogs) {
 
-		char *executed_gtid_set = NULL;
-
-		mysql_variable status[] = {
-			{"Executed_Gtid_Set", &executed_gtid_set},
-			{NULL, NULL}
-		};
-
-		read_mysql_variables(connection, "SHOW MASTER STATUS", status, false);
-
 		gtid_exists = (executed_gtid_set && *executed_gtid_set)
 				|| (gtid_binlog_state && *gtid_binlog_state);
-
-		free_mysql_variables(status);
 
 	}
 
@@ -1441,6 +1448,9 @@ cleanup:
 	}
 
 	free_mysql_variables(vars);
+
+cleanup2:
+	free_mysql_variables(status);
 
 	return(result);
 }
